@@ -5,10 +5,14 @@ import torch
 from PIL import Image
 import requests
 from io import BytesIO
-import streamlit as st
+import threading
+from fastapi import FastAPI, UploadFile, File, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from transformers import CLIPProcessor, CLIPModel
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance
+import uvicorn
 
 load_dotenv()
 
@@ -120,66 +124,141 @@ def index_folder_images(store, image_dir="images"):
                 )
                 processed_count += 1
             except Exception as e:
-                st.warning(f"Failed to process {filename}: {e}")
+                print(f"[ERROR] Failed to process {filename}: {e}")
     return processed_count
 
 
-def run_streamlit_app():
-    st.set_page_config(page_title="Qdrant Image Presence Check", layout="wide")
-    st.title("Qdrant Image Presence Check")
-    st.write("Upload a query image and check if a similar image already exists in Qdrant.")
+IMAGES_DIR = os.getenv("IMAGES_DIR", "images")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "image_embeddings_512")
 
-    QDRANT_URL = os.getenv("QDRANT_URL")
-    QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+app = FastAPI(title="Qdrant Image Presence API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    if not QDRANT_URL or not QDRANT_API_KEY:
-        st.error("Set QDRANT_URL and QDRANT_API_KEY in your .env file.")
-        st.stop()
+_store_instance = None
+_store_lock = threading.Lock()
 
-    store = CLIPEmbeddingStore(QDRANT_URL, QDRANT_API_KEY)
 
-    st.subheader("Query image and check presence")
+def get_store() -> CLIPEmbeddingStore:
+    global _store_instance
+    if _store_instance is not None:
+        return _store_instance
+    with _store_lock:
+        if _store_instance is not None:
+            return _store_instance
+
+        qdrant_url = os.getenv("QDRANT_URL")
+        qdrant_api_key = os.getenv("QDRANT_API_KEY")
+        if not qdrant_url or not qdrant_api_key:
+            raise RuntimeError("Set QDRANT_URL and QDRANT_API_KEY in your .env file.")
+
+        _store_instance = CLIPEmbeddingStore(
+            qdrant_url=qdrant_url,
+            qdrant_api_key=qdrant_api_key,
+            collection_name=COLLECTION_NAME,
+        )
+        return _store_instance
+
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/api/collection/count")
+def collection_count():
+    store = get_store()
     count = store.client.count(collection_name=store.collection_name, exact=True).count
-    st.caption(f"Collection `{store.collection_name}` currently has {count} vector(s).")
-    threshold = st.slider(
-        "Presence threshold (cosine similarity)",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.85,
-        step=0.01
-    )
-    top_k = st.slider("Top K matches", min_value=1, max_value=10, value=5, step=1)
-    uploaded = st.file_uploader("Upload query image", type=["jpg", "jpeg", "png", "webp"])
+    return {"collection": store.collection_name, "count": count}
 
-    if uploaded is not None:
-        query_image = Image.open(uploaded).convert("RGB")
-        st.image(query_image, caption="Query Image", use_container_width=True)
 
-        query_embedding = store.get_image_embedding_from_pil(query_image)
-        results = store.search_similar(query_embedding, limit=top_k)
+@app.get("/api/image")
+def get_indexed_image(file_name: str = Query(..., min_length=1)):
+    # Serve local indexed images so the React UI can show thumbnails.
+    safe_name = os.path.basename(file_name)
+    file_path = os.path.join(IMAGES_DIR, safe_name)
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="Image not found on disk.")
+    return FileResponse(file_path)
 
-        if not results:
-            st.warning("No results found in the collection.")
-            return
 
-        best_match = results[0]
-        best_score = float(best_match.score)
-        is_present = best_score >= threshold
+@app.post("/api/index")
+def index_images(image_dir: str = Query(default=IMAGES_DIR)):
+    store = get_store()
+    processed = index_folder_images(store, image_dir=image_dir)
+    return {"indexed": processed, "collection": store.collection_name}
 
-        if is_present:
-            st.success(f"Image is present (best similarity: {best_score:.3f} >= {threshold:.2f})")
-        else:
-            st.error(f"Image is NOT present (best similarity: {best_score:.3f} < {threshold:.2f})")
 
-        st.markdown("### Top Matches")
-        for r in results:
-            payload = r.payload or {}
-            file_name = payload.get("file_name", "unknown")
-            path = payload.get("path")
-            st.write(f"- id: `{r.id}`, score: `{float(r.score):.3f}`, file: `{file_name}`")
-            if path and os.path.exists(path):
-                st.image(path, caption=f"Match: {file_name} ({float(r.score):.3f})", width=220)
+@app.post("/api/presence")
+async def presence_check(
+    image: UploadFile = File(...),
+    threshold: float = Query(default=0.85, ge=0.0, le=1.0),
+    top_k: int = Query(default=5, ge=1, le=20),
+):
+    store = get_store()
+
+    raw = await image.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded image is empty.")
+
+    try:
+        query_image = Image.open(BytesIO(raw)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not parse image: {e}")
+
+    query_embedding = store.get_image_embedding_from_pil(query_image)
+    results = store.search_similar(query_embedding, limit=top_k)
+
+    if not results:
+        return {
+            "present": False,
+            "best_score": None,
+            "threshold": threshold,
+            "results": [],
+        }
+
+    best_match = results[0]
+    best_score = float(best_match.score)
+    is_present = best_score >= threshold
+
+    formatted = []
+    for r in results:
+        payload = r.payload or {}
+        formatted.append(
+            {
+                "id": str(r.id),
+                "score": float(r.score),
+                "file_name": payload.get("file_name"),
+            }
+        )
+
+    return {
+        "present": is_present,
+        "best_score": best_score,
+        "threshold": threshold,
+        "results": formatted,
+    }
 
 
 if __name__ == "__main__":
-    run_streamlit_app()
+    parser = None
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Qdrant image embedding service")
+    parser.add_argument("--index", action="store_true", help="Index images from IMAGES_DIR and exit")
+    parser.add_argument("--image-dir", default=IMAGES_DIR, help="Folder containing images to index")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8000)
+    args = parser.parse_args()
+
+    if args.index:
+        store = get_store()
+        processed = index_folder_images(store, image_dir=args.image_dir)
+        print(f"[OK] Indexed {processed} image(s) into `{store.collection_name}`.")
+    else:
+        uvicorn.run(app, host=args.host, port=args.port)

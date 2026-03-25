@@ -3,3 +3,6 @@ torch
 qdrant-client
 pillow
 requests
+fastapi
+uvicorn[standard]
+python-multipart

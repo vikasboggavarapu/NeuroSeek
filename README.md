@@ -16,6 +16,31 @@ This application uses OpenAI's CLIP model to generate embeddings for images and 
    ```
 
 ## Usage
+### Run the FastAPI backend
+
+1. Start the API server:
+   ```bash
+   python app.py
+   ```
+   It serves the endpoints under `http://localhost:8000/api/*`.
+
+2. (Optional) Index images from the local `images/` folder:
+   ```bash
+   python app.py --index
+   ```
+
+### Run the React frontend
+
+1. Install frontend deps (once):
+   ```bash
+   cd frontend
+   npm install
+   ```
+2. Start the dev server:
+   ```bash
+   npm run dev
+   ```
+3. Open `http://127.0.0.1:5173/` in your browser.
 
 ### Basic Example
 
